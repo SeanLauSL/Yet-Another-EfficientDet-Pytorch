@@ -1,4 +1,4 @@
-# Author: Zylo117
+# Author: Zylo117 seanlau
 
 """
 Simple Inference Script of EfficientDet-Pytorch
@@ -13,7 +13,10 @@ import cv2
 import numpy as np
 
 from efficientdet.utils import BBoxTransform, ClipBoxes
-from utils.utils import preprocess, invert_affine, postprocess
+from utils.utils import preprocess_single, invert_affine, postprocess
+
+from threading import Timer
+from multiprocessing import Process,Lock
 
 compound_coef = 0
 force_input_size = None  # set None to use default size
@@ -45,14 +48,6 @@ obj_list = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train'
 # tf bilinear interpolation is different from any other's, just make do
 input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536]
 input_size = input_sizes[compound_coef] if force_input_size is None else force_input_size
-ori_imgs, framed_imgs, framed_metas = preprocess(img_path, max_size=input_size)
-
-if use_cuda:
-    x = torch.stack([torch.from_numpy(fi).cuda() for fi in framed_imgs], 0)
-else:
-    x = torch.stack([torch.from_numpy(fi) for fi in framed_imgs], 0)
-
-x = x.to(torch.float32 if not use_float16 else torch.float16).permute(0, 3, 1, 2)
 
 model = EfficientDetBackbone(compound_coef=compound_coef, num_classes=len(obj_list),
                              ratios=anchor_ratios, scales=anchor_scales)
@@ -65,20 +60,11 @@ if use_cuda:
 if use_float16:
     model = model.half()
 
-with torch.no_grad():
-    features, regression, classification, anchors = model(x)
-
-    regressBoxes = BBoxTransform()
-    clipBoxes = ClipBoxes()
-
-    out = postprocess(x,
-                      anchors, regression, classification,
-                      regressBoxes, clipBoxes,
-                      threshold, iou_threshold)
-
-
-def display(preds, imgs, imshow=True, imwrite=False):
+def display(preds, imgs, *fps, imshow=True, imwrite=False):
     for i in range(len(imgs)):
+        #print("putText: ", fps)
+        cv2.putText( imgs[i], "FPS: " + str(fps[0]) + " Time: " + '{:.2f}'.format(fps[1]*1000) + "ms", ( 10, 20 ), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ( 0, 0, 255 ), 1 )
+
         if len(preds[i]['rois']) == 0:
             continue
 
@@ -92,17 +78,84 @@ def display(preds, imgs, imshow=True, imwrite=False):
                         (x1, y1 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (255, 255, 0), 1)
 
+
         if imshow:
             cv2.imshow('img', imgs[i])
-            cv2.waitKey(0)
+            cv2.waitKey(10)
 
         if imwrite:
             cv2.imwrite(f'test/img_inferred_d{compound_coef}_this_repo_{i}.jpg', imgs[i])
 
+# 声明互斥锁
+mutex = Lock();
+global fps 
+global framesnum
+fps = 0
+fpsdis = 0
+framesnum = 0
+# 定时任务
+def task():
+    global fps
+    global framesnum
 
-out = invert_affine(framed_metas, out)
-display(out, ori_imgs, imshow=True, imwrite=False)
+    mutex.acquire()
+    fps = framesnum
+    framesnum = 0
+    mutex.release()
+    #print("fps:", fps)
+    Timer(1, task, ()).start()
 
+def timedTask():
+    Timer(1, task, ()).start()
+
+cap = cv2.VideoCapture(0)
+cap.set(3,640) #设置分辨率
+cap.set(4,480)
+timedTask()
+
+while True:
+    ret, img = cap.read()
+    t_start = time.time()
+    ori_imgs, framed_imgs, framed_metas = preprocess_single(img, max_size=input_size)
+    if use_cuda:
+        x = torch.stack([torch.from_numpy(fi).cuda() for fi in framed_imgs], 0)
+    else:
+        x = torch.stack([torch.from_numpy(fi) for fi in framed_imgs], 0)
+
+    x = x.to(torch.float32 if not use_float16 else torch.float16).permute(0, 3, 1, 2)
+    with torch.no_grad():
+        features, regression, classification, anchors = model(x)
+
+        regressBoxes = BBoxTransform()
+        clipBoxes = ClipBoxes()
+
+        out = postprocess(x,
+                          anchors, regression, classification,
+                          regressBoxes, clipBoxes,
+                          threshold, iou_threshold)
+
+    out = invert_affine(framed_metas, out)
+    
+    mutex.acquire()
+    framesnum = framesnum + 1
+    fpsdis = fps
+    mutex.release()
+    
+    timecost = time.time() - t_start
+    #print("fpsdis:", fpsdis)
+    display(out, ori_imgs, fpsdis, timecost, imshow=True, imwrite=False)
+
+cap.release()
+cv2.destroyAllWindows()
+
+
+
+###############################################
+
+
+
+
+'''
 print('running speed test...')
 with torch.no_grad():
     print('test1: model inferring and postprocessing')
@@ -132,3 +185,4 @@ with torch.no_grad():
     # t2 = time.time()
     # tact_time = (t2 - t1) / 10
     # print(f'{tact_time} seconds, {32 / tact_time} FPS, @batch_size 32')
+'''    
